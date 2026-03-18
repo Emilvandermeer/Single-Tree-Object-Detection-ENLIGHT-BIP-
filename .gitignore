@@ -6,6 +6,13 @@ __pycache__/
 # C extensions
 *.so
 
+#DATA
+BIP_proj/annotations
+BIP_proj/data
+BIP_proj/data_unzip
+BIP_proj/data_unzip2
+BIP_proj/evaluation
+BIP_proj/training
 # Distribution / packaging
 .Python
 build/

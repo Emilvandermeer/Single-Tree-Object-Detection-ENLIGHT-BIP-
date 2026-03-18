@@ -5,6 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "imagecodecs>=2026.3.6",
+    "matplotlib>=3.10.8",
     "numpy>=2.4.3",
     "requests>=2.32.5",
+    "scikit-image>=0.26.0",
 ]
