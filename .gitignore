@@ -13,6 +13,7 @@ BIP_proj/data_unzip
 BIP_proj/data_unzip2
 BIP_proj/evaluation
 BIP_proj/training
+BIP_proj/crops_preview.png
 # Distribution / packaging
 .Python
 build/
