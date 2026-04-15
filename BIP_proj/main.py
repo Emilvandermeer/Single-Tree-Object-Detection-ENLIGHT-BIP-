@@ -7,6 +7,7 @@ def main():
     load_files()  # downloads + unzips everything first
     from dataset import NeonTreeTiledDataset, collate_fn   # was NeonTreeDataset
 
+    #Training dataset
     dataset = NeonTreeTiledDataset(
         rgb_dir="training/RGB",
         chm_dir="training/CHM",

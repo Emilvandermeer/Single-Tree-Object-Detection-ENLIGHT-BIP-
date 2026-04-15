@@ -34,7 +34,6 @@ def load_files():
             print(f"Failed to download file: {e}")
             return None
 
-    # Usage example
     OWNCLOUD_URL = "https://owncloud.gwdg.de/index.php/s/H6MsR0wVGRuPPl3/download"
     FILENAME = "dataset"
 
@@ -143,6 +142,6 @@ def load_files():
                         band = img[:,:,i]
                         ax[i].imshow(band)
                     plt.show()
-
         show_tif(tif_imgs)
-    display_data()
+    #! Uncomment to see images
+    #display_data()
