@@ -1,14 +1,3 @@
-"""
-train.py — Fine-tune Faster R-CNN for tree detection on 4-channel (RGB+CHM) input.
-
-Usage:
-    python train.py
-
-Outputs (written to ./checkpoints/):
-    best_model.pth      — weights with lowest validation loss
-    last_model.pth      — weights at the final epoch
-    training_log.csv    — per-epoch loss / LR history
-"""
 
 import copy
 import csv
@@ -17,12 +6,15 @@ from pathlib import Path
 
 import torch
 import torch.optim as optim
+
 from torch.utils.data import DataLoader, random_split
 import torchvision
+import torchvision.transforms.v2 as T
 from torchvision.models.detection import (
     fasterrcnn_mobilenet_v3_large_320_fpn,
     FasterRCNN_MobileNet_V3_Large_320_FPN_Weights,
 )
+from torchvision.tv_tensors import BoundingBoxes
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.transform import GeneralizedRCNNTransform
 
@@ -31,16 +23,15 @@ from dataset import NeonTreeTiledDataset, collate_fn
 
 
 
-
 CFG = dict(
-    # Data split Split 80 / 10 / 10  = train/ test / val
+    # Data split Split 80 / 10 / 10  
     val_fraction   = 0.10,
     test_fraction  = 0.10,
     seed           = 42,
     num_classes    = 2, 
 
     # Training
-    num_epochs     = 30,
+    num_epochs     = 50,
     batch_size     = 6,
     num_workers    = 6,           
 
@@ -50,8 +41,8 @@ CFG = dict(
     weight_decay   = 1e-4,
 
     # LR schedule
-    lr_patience    = 4,           # epochs without improvement before LR drop
-    lr_factor      = 0.5,         # multiply LR by this on plateau
+    lr_patience    = 4,
+    lr_factor      = 0.5,         
     min_lr         = 1e-6,
 
     # Early stopping
@@ -60,16 +51,14 @@ CFG = dict(
     # Gradient clipping 
     grad_clip      = 5.0,
     
-    # Misc
     checkpoint_dir = "checkpoints",
-    amp            = True,        # mixed-precision (set False if no CUDA)
+    amp            = True,        
 )
 
 
-# ── 4-channel backbone ─────────────────────────────────────────────────────────
 
 def patch_first_conv(module):
-    """Recursively find and patch the first Conv2d(3→N) to accept 4 channels."""
+    """ find and patch the first Conv2d to accept 4 channels."""
     for name, child in module.named_children():
         if isinstance(child, torch.nn.Conv2d) and child.in_channels == 3:
             new_conv = torch.nn.Conv2d(
@@ -92,8 +81,7 @@ def patch_first_conv(module):
 
 def build_4ch_faster_rcnn(num_classes: int) -> torch.nn.Module:
     """
-    Faster R-CNN with MobileNetV3 backbone patched for
-    4-channel (RGB + CHM) input.
+    Patching for 4 channel (RGB + CHM) input
     """
     model = fasterrcnn_mobilenet_v3_large_320_fpn(
         weights=FasterRCNN_MobileNet_V3_Large_320_FPN_Weights.DEFAULT
@@ -105,10 +93,17 @@ def build_4ch_faster_rcnn(num_classes: int) -> torch.nn.Module:
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
 
+    #Changing # of possible detections as there can be many trees in a tile
+    model.rpn.pre_nms_top_n_train  = 4000   
+    model.rpn.post_nms_top_n_train = 2000   
+    model.rpn.pre_nms_top_n_test   = 2000
+    model.rpn.post_nms_top_n_test  = 1000
+    model.roi_heads.detections_per_img = 300
+
     #4-channel identity transform, must be redefined for 4dimensions 
     model.transform = GeneralizedRCNNTransform(
-        min_size   = 320,
-        max_size   = 320,
+        min_size   = 512, 
+        max_size   = 512, 
         image_mean = [0.0, 0.0, 0.0, 0.0],
         image_std  = [1.0, 1.0, 1.0, 1.0],
     )
@@ -120,7 +115,7 @@ def build_4ch_faster_rcnn(num_classes: int) -> torch.nn.Module:
 
 def batch_to_targets(boxes_list, labels_list, device):
     """
-    Convert collated batch lists into the list-of-dicts format Faster R-CNN
+    Convert collated batch lists into the list-of-dicts format faster R-CNN
     expects.  Labels are shifted +1 because 0 is reserved for background.
     """
     targets = []
@@ -132,16 +127,36 @@ def batch_to_targets(boxes_list, labels_list, device):
     return targets
 
 
-# ── One training epoch ─────────────────────────────────────────────────────────
-
 def train_one_epoch(model, loader, optimiser, device, scaler, grad_clip):
     model.train()
     total_loss = 0.0
     n_batches  = 0
 
+    train_transforms = T.Compose([
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.5),
+            T.RandomRotation(degrees=90),         
+        ])
+
     for batch in loader:
         images  = batch['image'].to(device)
         targets = batch_to_targets(batch['boxes'], batch['labels'], device)
+
+        aug_images  = []
+        aug_targets = []
+        for img, tgt in zip(images, targets):
+            boxes_tv = BoundingBoxes(
+                tgt['boxes'].cpu(),
+                format       = 'XYXY',
+                canvas_size  = (img.shape[1], img.shape[2]),
+            )
+            img_aug, boxes_aug = train_transforms(img, boxes_tv)
+            img_aug = img_aug.clamp(-3.0, 3.0)
+            aug_images.append(img_aug.to(device))
+            aug_targets.append({
+                'boxes':  boxes_aug.data.to(device),
+                'labels': tgt['labels'],
+            })
 
         optimiser.zero_grad()
 
@@ -170,12 +185,7 @@ def train_one_epoch(model, loader, optimiser, device, scaler, grad_clip):
 
 @torch.no_grad()
 def evaluate_loss(model, loader, device):
-    """
-    Faster R-CNN only returns losses when in train() mode and given targets.
-    We switch to train mode temporarily but disable dropout/BN updates via
-    no_grad, which is fine for loss estimation.
-    """
-    model.train()          # needed to get loss dict
+    model.train()         
     total_loss = 0.0
     n_batches  = 0
 
@@ -217,7 +227,7 @@ def main():
     load_files()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nUsing device: {device}")
+    print(f"Using device: {device}")
 
     use_amp = CFG['amp'] and torch.cuda.is_available()
     scaler  = torch.amp.GradScaler('cuda') if use_amp else None
@@ -241,23 +251,14 @@ def main():
         dataset, [n_train, n_val, n_test], generator=generator
     )
 
-    N_TRAIN_SUBSET = 100000
-    if N_TRAIN_SUBSET and N_TRAIN_SUBSET < len(train_ds):
-        indices = torch.randperm(len(train_ds), generator=generator)[:N_TRAIN_SUBSET]
-        train_ds = torch.utils.data.Subset(train_ds, indices.tolist())
-    
-    N_DEV_SUBSET = 100000
-    if N_DEV_SUBSET and N_DEV_SUBSET < len(val_ds):
-        indices2 = torch.randperm(len(val_ds), generator=generator)[:N_DEV_SUBSET]
-        val_ds = torch.utils.data.Subset(val_ds, indices2.tolist())
-    
 
-    # Save the test indices so test.py can reconstruct the exact same split
     ckpt_dir = Path(CFG['checkpoint_dir'])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(test_ds.indices, ckpt_dir / 'test_indices.pt')
 
     print(f"  Train: {n_train}  Val: {n_val}  Test: {n_test} crops")
+
+    #Data loaders for training and val
 
     train_loader = DataLoader(
         train_ds,
@@ -266,7 +267,10 @@ def main():
         collate_fn  = collate_fn,
         num_workers = CFG['num_workers'],
         pin_memory  = torch.cuda.is_available(),
+        persistent_workers = True,
+        prefetch_factor = 2,
     )
+
     val_loader = DataLoader(
         val_ds,
         batch_size  = CFG['batch_size'],
@@ -274,6 +278,8 @@ def main():
         collate_fn  = collate_fn,
         num_workers = CFG['num_workers'],
         pin_memory  = torch.cuda.is_available(),
+        persistent_workers = True,
+        prefetch_factor = 2,
     )
 
     #! Model 
@@ -286,13 +292,12 @@ def main():
     head_params     = [p for n, p in model.named_parameters()
                        if 'backbone' not in n and p.requires_grad]
 
-    optimiser = optim.SGD(
-        [
-            {'params': backbone_params, 'lr': CFG['lr'] * 0.1},   # slower for pretrained
-            {'params': head_params,     'lr': CFG['lr']},
-        ],
-        momentum     = CFG['momentum'],
-        weight_decay = CFG['weight_decay'],
+    optimiser = optim.AdamW(
+    [
+        {'params': backbone_params, 'lr': 1e-5},  
+        {'params': head_params,     'lr': 1e-4},  
+    ],
+    weight_decay = 1e-4,
     )
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -305,26 +310,15 @@ def main():
 
     early_stop = EarlyStopping(CFG['es_patience'])
 
-    # ── Checkpointing setup ───────────────────────────────────────────────────
-    log_path = ckpt_dir / 'training_log.csv'
-    with open(log_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'val_loss',
-                         'epoch_time_s'])
+    #Checkpointing stuff
 
     best_val_loss  = float('inf')
     best_weights   = None
 
-    # ── Epoch loop ────────────────────────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    print(f"{'Epoch':>6}  {'Train Loss':>11}  {'Val Loss':>10}  "
-          f" {'Time':>7}")
-    print(f"{'─'*65}")
-
-    for p in model.backbone.parameters():
-        p.requires_grad = False
-
+    #  Epoch loop
+    print(f"{'Epoch':>6}  {'Train Loss':>11}  {'Val Loss':>10}  {'Time':>7}")
     for epoch in range(1, CFG['num_epochs'] + 1):
+        
         t0 = time.time()
 
         train_loss = train_one_epoch(
@@ -347,17 +341,12 @@ def main():
                  'optimiser_state_dict': optimiser.state_dict()},
                 ckpt_dir / 'best_model.pth'
             )
-            marker = '  ✓ best'
+            marker = 'best'
         else:
             marker = ''
 
         print(f"{epoch:>6}  {train_loss:>11.4f}  {val_loss:>10.4f}  "
               f"{elapsed:>6.1f}s{marker}")
-
-        # Append to log
-        with open(log_path, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([epoch, train_loss, val_loss,f'{elapsed:.1f}'])
 
         # Early stopping check
         if early_stop.step(val_loss, epoch):

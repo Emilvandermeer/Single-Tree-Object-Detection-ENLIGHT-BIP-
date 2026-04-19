@@ -1,12 +1,3 @@
-"""
-Each large image is divided into (CROP_SIZE × CROP_SIZE) crops with a
-configurable overlap (stride). For every crop we:
-  1. Cut the same window out of RGB and CHM (after upsampling CHM to RGB res)
-  2. Keep only boxes whose centre falls inside the crop window
-  3. Clip those boxes to the crop boundary
-  4. Discard boxes that become too small after clipping (min_box_side pixels)
-  5. Shift box coordinates so they are relative to the crop origin
-"""
 
 import os
 import xml.etree.ElementTree as ET
@@ -18,9 +9,6 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 
-
-
-# Normalisation constants  (update with dataset-wide stats if desired)
 RGB_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 RGB_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 CHM_MEAN = 5.0
@@ -28,22 +16,18 @@ CHM_STD  = 5.0
 
 
 
-# Low-level I/O
 def load_rgb(path: str | Path) -> np.ndarray:
-    """Load RGB .tif → uint8 (H, W, 3)."""
+    """Load RGB .tif into (H, W, 3)."""
     return np.array(Image.open(path).convert('RGB'), dtype=np.uint8)
 
 
 def load_chm(path: str | Path) -> np.ndarray:
-    """Load single-band CHM .tif → float32 (H, W), nodata → 0."""
     arr = np.array(Image.open(path), dtype=np.float32)
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     return np.clip(arr, 0.0, None)
 
 
-def resize_numpy(arr: np.ndarray, h: int, w: int,
-                 resample=Image.BILINEAR) -> np.ndarray:
-    """Resize a numpy array (H,W) or (H,W,C) to (h,w[,C])."""
+def resize_numpy(arr: np.ndarray, h: int, w: int, resample=Image.BILINEAR) -> np.ndarray:
     dtype = arr.dtype
     if arr.ndim == 2:
         out = np.array(Image.fromarray(arr, mode='F').resize((w, h), resample),
@@ -55,12 +39,11 @@ def resize_numpy(arr: np.ndarray, h: int, w: int,
 
 
 
-# XML parsing
+
 def parse_annotation(xml_path: str | Path) -> dict:
     """
-    Parse Pascal-VOC-style XML.
+    Parse XML.
     Returns dict with keys: filename, orig_w, orig_h, boxes (N,4), labels.
-    Handles the non-standard <n> tag used in this dataset.
     """
     root = ET.parse(xml_path).getroot()
     size = root.find('size')
@@ -88,17 +71,15 @@ def parse_annotation(xml_path: str | Path) -> dict:
 
 # Box clipping helpers
 
-def clip_boxes_to_crop(boxes: np.ndarray, labels: list,
-                       x0: int, y0: int, x1: int, y1: int,
-                       min_box_side: float = 4.0,
+def clip_boxes_to_crop(boxes: np.ndarray, labels: list, x0: int, y0: int, x1: int, y1: int, min_box_side: float = 4.0,
                        centre_must_be_inside: bool = True
                        ) -> tuple[np.ndarray, list]:
     """
-    Given global-coordinate boxes, keep those relevant to crop [x0,y0,x1,y1],
+    given global-coordinate boxes, keep those relevant to crop [x0,y0,x1,y1],
     clip them to the crop boundary, and shift to crop-local coordinates.
 
     centre_must_be_inside=True  → only keep boxes whose centre is in the crop
-                                   (avoids double-counting at tile borders)
+        
     centre_must_be_inside=False → keep any box that overlaps the crop at all
 
     min_box_side: after clipping, discard boxes narrower/shorter than this (px).
@@ -127,7 +108,7 @@ def clip_boxes_to_crop(boxes: np.ndarray, labels: list,
     clipped[:, 2] = np.clip(boxes[:, 2], x0, x1) - x0  # xmax
     clipped[:, 3] = np.clip(boxes[:, 3], y0, y1) - y0  # ymax
 
-    # Drop boxes that shrank too much after clipping
+    # dont include boxes that shrank too much after clipping
     w = clipped[:, 2] - clipped[:, 0]
     h = clipped[:, 3] - clipped[:, 1]
     valid  = (w >= min_box_side) & (h >= min_box_side)
@@ -136,11 +117,7 @@ def clip_boxes_to_crop(boxes: np.ndarray, labels: list,
 
     return clipped.astype(np.float32), labels
 
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Tile index builder
-# ──────────────────────────────────────────────────────────────────────────────
-
 def build_tile_index(image_h: int, image_w: int,
                      crop_size: int, stride: int
                      ) -> list[tuple[int, int, int, int]]:
@@ -191,13 +168,9 @@ class NeonTreeTiledDataset(Dataset):
     crop_size : spatial size of each crop in pixels (default 512)
     stride    : step between crop origins; stride < crop_size means overlapping
                 crops. Use stride = crop_size for non-overlapping tiles.
-                Use stride = crop_size // 2 for 50% overlap (more training data,
-                trees near borders appear in multiple crops).
-    min_box_side : discard boxes smaller than this after clipping (px)
+                Use stride = crop_size // 2 for 50% overlap 
+    min_box_side : discard boxes smaller than this after clipping 
     skip_empty   : if True, crops with zero boxes are excluded from the dataset
-                   (speeds up training; set False if you want hard negatives)
-    centre_must_be_inside : see clip_boxes_to_crop docstring
-    transforms   : optional callable applied to the output dict
     """
 
     CLASS_NAMES = ['Tree']
@@ -246,7 +219,7 @@ class NeonTreeTiledDataset(Dataset):
 
             ann = parse_annotation(xml_path)
 
-            # Get real image dimensions cheaply without decoding pixels
+            # Get image dimensions
             with Image.open(rgb_path) as im:
                 real_w, real_h = im.size   # PIL returns (width, height)
 
@@ -295,7 +268,7 @@ class NeonTreeTiledDataset(Dataset):
         with Image.open(entry['rgb_path']) as im:
             rgb_crop = np.array(im.convert('RGB'), dtype=np.uint8)[y0:y1, x0:x1]
 
-        # ── 2. Load CHM crop (extract at CHM resolution, upsample to crop_size)
+        #Load CHM crop , extract at CHM resolution, upsample to crop_size
         if entry['chm_path'] is not None:
             with Image.open(entry['chm_path']) as im:
                 chm_full = np.array(im, dtype=np.float32)
@@ -322,10 +295,9 @@ class NeonTreeTiledDataset(Dataset):
             chm_crop = np.zeros((cs, cs), dtype=np.float32)
 
         # 3. Normalise
-        rgb_norm = normalise_rgb(rgb_crop)              # (H, W, 3) float32
-        chm_norm = normalise_chm(chm_crop)[..., None]  # (H, W, 1) float32
+        rgb_norm = normalise_rgb(rgb_crop)              
+        chm_norm = normalise_chm(chm_crop)[..., None]  
 
-        #4. Fuse → (4, H, W) tensor 
         fused = np.concatenate([rgb_norm, chm_norm], axis=-1)
         image_tensor = torch.from_numpy(fused.transpose(2, 0, 1))
 
@@ -337,9 +309,9 @@ class NeonTreeTiledDataset(Dataset):
         labels_tensor = torch.tensor(label_idx, dtype=torch.int64)
 
         sample = {
-            'image':   image_tensor,    # float32 (4, crop_size, crop_size)
-            'boxes':   boxes_tensor,    # float32 (N, 4) — crop-local coords
-            'labels':  labels_tensor,   # int64   (N,)
+            'image':   image_tensor,    
+            'boxes':   boxes_tensor,    
+            'labels':  labels_tensor,   
             'stem':    entry['stem'],
             'window':  entry['window'],
         }
@@ -348,9 +320,8 @@ class NeonTreeTiledDataset(Dataset):
         return sample
 
 
-# DataLoader collate
+
 def collate_fn(batch: list[dict]) -> dict:
-    """Stack images; keep boxes/labels as lists (variable N per crop)."""
     return {
         'image':  torch.stack([s['image']  for s in batch]),
         'boxes':  [s['boxes']  for s in batch],
